@@ -12,12 +12,14 @@ namespace StreamCompaction {
             return timer;
         }
 
-        int blockSize = 128;
+        //int blockSize = 256;
 
         __global__ void upScan(int n, int* data, int levelPowered) {
             if ((blockIdx.x * blockDim.x) + threadIdx.x > n) {
                 return;
             }
+            int stride = (1 << levelPowered);
+            int groups = n / (1 << levelPowered);
             int index = ((blockIdx.x * blockDim.x) + threadIdx.x) * (1 << levelPowered) -1;
             if (index >  n || index < 0) {
                 return;
@@ -38,16 +40,10 @@ namespace StreamCompaction {
             data[index - (1 << (levelPowered - 1))] = store;          
         }
 
-        __global__ void storeLast(int n, int* data) {
-            data[n - 1] = 0;
-        }
-
         /**
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
          */
-        void scan(int n, int *odata, const int *idata, bool time) {
-            if(time)
-                timer().startGpuTimer();
+        void scan(int n, int *odata, const int *idata, bool time, int blockSize) {
             // TODO
             int requiredLevels = ilog2ceil(n);
             int fullSize = (1 << requiredLevels);
@@ -60,26 +56,37 @@ namespace StreamCompaction {
             int levelPowered = 1;
             dim3 fullBlocksPerGrid(fullSize / (1 << levelPowered) / blockSize);
 
+            if (time)
+                timer().startGpuTimer();
+
+            int runcount = 0;
             while (levelPowered <= requiredLevels) {
                 fullBlocksPerGrid = dim3((fullSize / (1 << levelPowered) + blockSize) / blockSize);
                 upScan << < fullBlocksPerGrid, blockSize >> > (fullSize-1, data, levelPowered);
+                runcount++;
                 levelPowered++;
             }
+
+            if (time) {
+                timer().endGpuTimer();
+            }
+
             
             levelPowered--;
             fullBlocksPerGrid = dim3(1, 1, 1);
-            storeLast << <fullBlocksPerGrid, 1 >> > (fullSize, data);
+            cudaMemset(data + fullSize - 1, 0, sizeof(int));
+
+
 
             while (levelPowered > 0) {
                 fullBlocksPerGrid = dim3((fullSize / (1 << levelPowered) + blockSize) / blockSize);
                 downSweep << < fullBlocksPerGrid, blockSize >> > (fullSize-1, data, levelPowered);
                 levelPowered--;
             }
-            
-            cudaMemcpy(odata, data, n * sizeof(int), cudaMemcpyDeviceToHost);
-            
-            if(time)
-                timer().endGpuTimer();
+         
+            cudaMemcpy(odata, data, n * sizeof(int), cudaMemcpyDeviceToHost);     
+
+            cudaFree(data);
         }
 
 
@@ -93,8 +100,7 @@ namespace StreamCompaction {
          * @param idata  The array of elements to compact.
          * @returns      The number of elements remaining after compaction.
          */
-        int compact(int n, int *odata, const int *idata) {
-            timer().startGpuTimer();
+        int compact(int n, int *odata, const int *idata, int blockSize) {
             // TODO           
             int* boolsGpu;
             int* odataGpu;
@@ -110,6 +116,7 @@ namespace StreamCompaction {
 
             dim3 fullBlocksPerGrid((n + blockSize - 1) / blockSize);
 
+            timer().startGpuTimer();
 
             Common::kernResetIntBuffer << < fullBlocksPerGrid, blockSize >> > (n, dataGpu, 0);
             Common::kernResetIntBuffer << < fullBlocksPerGrid, blockSize >> > (n, odataGpu, 0);
@@ -131,7 +138,7 @@ namespace StreamCompaction {
 
                 levelPowered--;
                 fullBlocksPerGrid = dim3(1, 1, 1);
-                storeLast << <fullBlocksPerGrid, 1 >> > (fullSize, scanGpu);
+                cudaMemset(scanGpu + fullSize - 1, 0, sizeof(int));
 
                 while (levelPowered > 0) {
                     fullBlocksPerGrid = dim3((fullSize / (1 << levelPowered) + blockSize) / blockSize);
@@ -141,11 +148,13 @@ namespace StreamCompaction {
 
             cudaMemcpy(odata, scanGpu, n * sizeof(int), cudaMemcpyDeviceToHost);
 
+            //0 check for last element: this causes headaches if you just return store!
             int store = idata[n - 1] == 0 ? odata[n - 1] : odata[n - 1] + 1;
             fullBlocksPerGrid = dim3((n + blockSize - 1) / blockSize);
 
             Common::kernScatter << < fullBlocksPerGrid, blockSize >> > (n, odataGpu, dataGpu, boolsGpu, scanGpu);
-            
+            timer().endGpuTimer();
+
             cudaMemcpy(odata, odataGpu, n * sizeof(int), cudaMemcpyDeviceToHost);
 
             cudaFree(boolsGpu);
@@ -153,8 +162,6 @@ namespace StreamCompaction {
             cudaFree(odataGpu);
             cudaFree(dataGpu);
 
-            timer().endGpuTimer();
-            //0 check for last element: this causes headaches if you just return store!
             return store;
         }
     }

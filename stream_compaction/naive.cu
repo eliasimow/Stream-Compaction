@@ -32,8 +32,6 @@ namespace StreamCompaction {
          * Performs prefix-sum (aka scan) on idata, storing the result into odata.
          */
         void scan(int n, int *odata, const int *idata) {
-
-            timer().startGpuTimer();
             dim3 fullBlocksPerGrid((n + blockSize - 1) / blockSize);
 
             int requiredLevels = ilog2ceil(n);
@@ -46,22 +44,26 @@ namespace StreamCompaction {
             cudaMemcpy(pong1, idata, sizeof(int) * n, cudaMemcpyHostToDevice);
 
             int levelPowered = 1;
+
+            timer().startGpuTimer();
+
             while (levelPowered <= requiredLevels) {
                 scan << < fullBlocksPerGrid, blockSize >> > ((1 << requiredLevels), pong2, pong1, levelPowered);
                 levelPowered++;
                 std::swap(pong1, pong2);
             }
+
+            timer().endGpuTimer();
+
             // TODO
             cudaMemcpy(odata, pong1, n * sizeof(int), cudaMemcpyDeviceToHost);
 
-            for (int i = (1 << requiredLevels); i >= 0; --i) {
+            for (int i = n-1; i >= 0; --i) {
                 odata[i] = i == 0 ? 0 : odata[i - 1];
             }
 
             cudaFree(pong1);
             cudaFree(pong2);
-
-            timer().endGpuTimer();
         }
     }
 }
